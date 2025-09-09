@@ -15,8 +15,15 @@ File parsers for the BitBake build tools.
 #
 
 handlers = []
+# Cache mapping file extensions to the handler dict for faster dispatch
+_supports_cache = {}
+try:
+    from bb.parse import metrics as _bb_metrics
+except Exception:
+    _bb_metrics = None
 
 import errno
+from collections import deque
 import logging
 import os
 import stat
@@ -47,6 +54,8 @@ class SkipPackage(SkipRecipe):
     """Exception raised to skip this recipe (use SkipRecipe in new code)"""
 
 __mtime_cache = {}
+# Maximum entries for resolve_file() memoization
+_RESOLVE_CACHE_MAX = 8192
 def cached_mtime(f):
     if f not in __mtime_cache:
         res = os.stat(f)
@@ -104,19 +113,36 @@ def check_dependency(d, f):
     deps = (d.getVar('__depends', False) or [])
     return s in deps
    
-def supports(fn, data):
-    """Returns true if we have a handler for this file, false otherwise"""
+def _get_handler(fn, data):
+    """Return the handler dict for this filename or None"""
+    ext = os.path.splitext(fn)[1]
+    if not os.environ.get('BB_OPT_DISABLE_SUPPORTS_CACHE') and ext in _supports_cache:
+        if _bb_metrics:
+            _bb_metrics.hit('supports')
+        return _supports_cache[ext]
     for h in handlers:
         if h['supports'](fn, data):
-            return 1
-    return 0
+            if not os.environ.get('BB_OPT_DISABLE_SUPPORTS_CACHE'):
+                _supports_cache[ext] = h
+            if _bb_metrics:
+                _bb_metrics.miss('supports')
+            return h
+    if not os.environ.get('BB_OPT_DISABLE_SUPPORTS_CACHE'):
+        _supports_cache[ext] = None
+    if _bb_metrics:
+        _bb_metrics.miss('supports')
+    return None
+
+def supports(fn, data):
+    """Returns true if we have a handler for this file, false otherwise"""
+    return 1 if _get_handler(fn, data) else 0
 
 def handle(fn, data, include=0, baseconfig=False):
     """Call the handler that is appropriate for this file"""
-    for h in handlers:
-        if h['supports'](fn, data):
-            with data.inchistory.include(fn):
-                return h['handle'](fn, data, include, baseconfig)
+    h = _get_handler(fn, data)
+    if h:
+        with data.inchistory.include(fn):
+            return h['handle'](fn, data, include, baseconfig)
     raise ParseError("not a BitBake file", fn)
 
 def init(fn, data):
@@ -130,21 +156,71 @@ def init_parser(d):
     bb.parse.siggen = bb.siggen.init(d)
 
 def resolve_file(fn, d):
-    if not os.path.isabs(fn):
-        bbpath = d.getVar("BBPATH")
-        newfn, attempts = bb.utils.which(bbpath, fn, history=True)
-        for af in attempts:
-            mark_dependency(d, af)
-        if not newfn:
-            raise IOError(errno.ENOENT, "file %s not found in %s" % (fn, bbpath))
-        fn = newfn
-    else:
-        mark_dependency(d, fn)
+    # Lightweight memoization of resolution to cut repeated BBPATH scans
+    # Key on (requested fn, absolute flag, BBPATH). Attempts are re-marked
+    # every call to preserve dependency tracking semantics.
+    global _resolve_cache, _resolve_cache_order
+    try:
+        _resolve_cache
+    except NameError:
+        _resolve_cache = {}
+        _resolve_cache_order = deque()
 
-    if not os.path.isfile(fn):
-        raise IOError(errno.ENOENT, "file %s not found" % fn)
+    m = _bb_metrics
+    _tok = None
+    if m:
+        try:
+            _tok = m.time_start('resolve_file')
+        except Exception:
+            _tok = None
+    try:
+        if not os.path.isabs(fn):
+            bbpath = d.getVar("BBPATH")
+            key = (fn, False, bbpath)
+            disable_cache = os.environ.get('BB_OPT_DISABLE_RESOLVE_CACHE')
+            cached = None if disable_cache else _resolve_cache.get(key)
+            if cached is not None:
+                newfn, attempts = cached
+                # Refresh simple LRU order
+                try:
+                    _resolve_cache_order.remove(key)
+                except ValueError:
+                    pass
+                _resolve_cache_order.append(key)
+                if _bb_metrics:
+                    _bb_metrics.hit('resolve_file')
+            else:
+                newfn, attempts = bb.utils.which(bbpath, fn, history=True)
+                # Maintain bounded cache size
+                if not disable_cache:
+                    _resolve_cache[key] = (newfn, tuple(attempts))
+                    _resolve_cache_order.append(key)
+                    if len(_resolve_cache_order) > _RESOLVE_CACHE_MAX:
+                        old = _resolve_cache_order.popleft()
+                        _resolve_cache.pop(old, None)
+                        if _bb_metrics:
+                            _bb_metrics.evict('resolve_file')
+                if _bb_metrics:
+                    _bb_metrics.miss('resolve_file')
 
-    return fn
+            for af in attempts:
+                mark_dependency(d, af)
+            if not newfn:
+                raise IOError(errno.ENOENT, "file %s not found in %s" % (fn, bbpath))
+            fn = newfn
+        else:
+            mark_dependency(d, fn)
+
+        if not os.path.isfile(fn):
+            raise IOError(errno.ENOENT, "file %s not found" % fn)
+
+        return fn
+    finally:
+        if m and _tok:
+            try:
+                m.time_end('resolve_file', _tok)
+            except Exception:
+                pass
 
 # Used by OpenEmbedded metadata
 __pkgsplit_cache__={}

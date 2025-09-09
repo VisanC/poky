@@ -1167,6 +1167,91 @@ def break_hardlinks(src, sstat = None):
         return True
     return copyfile(src, src, sstat=sstat)
 
+_which_cache = {}
+_which_cache_order = []
+_which_cache_max = 8192
+_bb_metrics = None
+
+def _get_metrics():
+    """Lazily import metrics to avoid early import cycles."""
+    global _bb_metrics
+    if _bb_metrics is None or _bb_metrics is False:
+        try:
+            import importlib
+            _bb_metrics = importlib.import_module('bb.parse.metrics')
+        except Exception:
+            _bb_metrics = False
+    return _bb_metrics if _bb_metrics not in (None, False) else None
+
+# Per-directory entry index to reduce filesystem stats when scanning paths
+_dir_index = {}
+_dir_index_order = []
+_dir_index_max = 1024
+
+def _dir_entries(path):
+    """Return cached set of basenames in directory, updating on mtime/inode change.
+    Returns None if path is not a directory or not accessible.
+    """
+    try:
+        st = os.stat(path)
+        key = path
+    except Exception:
+        return None
+    try:
+        ent = _dir_index.get(key)
+        if ent is not None:
+            (mtime, ino, names) = ent
+            if mtime == st.st_mtime_ns and ino == st.st_ino:
+                # Refresh simple LRU
+                try:
+                    _dir_index_order.remove(key)
+                except ValueError:
+                    pass
+                _dir_index_order.append(key)
+                return names
+    except Exception:
+        pass
+    # (Re)build index
+    try:
+        names = set()
+        with os.scandir(path) as it:
+            for de in it:
+                names.add(de.name)
+        _dir_index[key] = (st.st_mtime_ns, st.st_ino, names)
+        _dir_index_order.append(key)
+        if len(_dir_index_order) > _dir_index_max:
+            old = _dir_index_order.pop(0)
+            _dir_index.pop(old, None)
+        return names
+    except Exception:
+        return None
+
+def _which_cache_get(key):
+    try:
+        # Keep a simple LRU order; move key to tail on hit
+        _which_cache_order.remove(key)
+        _which_cache_order.append(key)
+        val = _which_cache[key]
+        m = _get_metrics()
+        if m:
+            m.hit('which')
+        return val
+    except (ValueError, KeyError):
+        m = _get_metrics()
+        if m:
+            m.miss('which')
+        return None
+
+def _which_cache_put(key, value):
+    _which_cache[key] = value
+    _which_cache_order.append(key)
+    if len(_which_cache_order) > _which_cache_max:
+        old = _which_cache_order.pop(0)
+        _which_cache.pop(old, None)
+        m = _get_metrics()
+        if m:
+            m.evict('which')
+
 def which(path, item, direction = 0, history = False, executable=False):
     """
     Locate ``item`` in the list of paths ``path`` (colon separated string like
@@ -1189,29 +1274,76 @@ def which(path, item, direction = 0, history = False, executable=False):
     tuple with the found (or not found) item as ``(item, history)``.
     """
 
-    if executable:
-        is_candidate = lambda p: os.path.isfile(p) and os.access(p, os.X_OK)
-    else:
-        is_candidate = lambda p: os.path.exists(p)
+    m = _get_metrics()
+    _tok = None
+    if m:
+        try:
+            _tok = m.time_start('which')
+        except Exception:
+            _tok = None
+    try:
+        if executable:
+            is_candidate = lambda p: os.path.isfile(p) and os.access(p, os.X_OK)
+        else:
+            is_candidate = lambda p: os.path.exists(p)
 
-    hist = []
-    paths = (path or "").split(':')
-    if direction != 0:
-        paths.reverse()
-
-    for p in paths:
-        next = os.path.join(p, item)
-        hist.append(next)
-        if is_candidate(next):
-            if not os.path.isabs(next):
-                next = os.path.abspath(next)
+        # Cache by inputs that affect search outcome (optional)
+        disable_cache = os.environ.get('BB_OPT_DISABLE_WHICH_CACHE')
+        cachekey = (path or "", item, 1 if direction else 0, 1 if executable else 0)
+        cached = None if disable_cache else _which_cache_get(cachekey)
+        if cached is not None:
+            found, hist = cached
             if history:
-                return next, hist
-            return next
+                return found, list(hist)
+            return found
 
-    if history:
-        return "", hist
-    return ""
+        hist = []
+        paths = (path or "").split(':')
+        if direction != 0:
+            paths.reverse()
+
+        for p in paths:
+            next = os.path.join(p, item)
+            hist.append(next)
+            # Fast-path filter: if the parent directory listing doesn't contain the basename, skip costly stat()
+            d, base = os.path.split(next)
+            if base:
+                disable_dir_index = os.environ.get('BB_OPT_DISABLE_DIR_INDEX')
+                names = None if disable_dir_index else _dir_entries(d)
+                if names is not None:
+                    if base not in names:
+                        # Directory index filtered out a non-existent candidate
+                        m2 = _get_metrics()
+                        if m2:
+                            m2.hit('which_dir_index')
+                        continue
+                    else:
+                        m2 = _get_metrics()
+                        if m2:
+                            m2.miss('which_dir_index')
+            if is_candidate(next):
+                if not os.path.isabs(next):
+                    next = os.path.abspath(next)
+                result = next
+                if not disable_cache:
+                    _which_cache_put(cachekey, (result, tuple(hist)))
+                if history:
+                    return result, hist
+                return result
+
+        # Not found after scanning all paths — cache negative result if enabled
+        result = ""
+        if not disable_cache:
+            _which_cache_put(cachekey, (result, tuple(hist)))
+        if history:
+            return result, hist
+        return result
+    finally:
+        if m and _tok:
+            try:
+                m.time_end('which', _tok)
+            except Exception:
+                pass
 
 def to_filemode(input):
     """

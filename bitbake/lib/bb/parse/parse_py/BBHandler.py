@@ -37,6 +37,179 @@ __classname__ = ""
 __residue__ = []
 
 cached_statements = {}
+try:
+    from bb.parse import metrics as _bb_metrics
+except Exception:
+    _bb_metrics = None
+_inherit_resolved_cache = {}
+_inherit_resolved_order = []
+_inherit_resolved_max = 8192
+
+# Class name → absolute path index per (BBPATH, classtype) to avoid repeated which() scans
+_class_index_cache = {}
+_class_index_order = []
+_class_index_max = 128
+
+def _bbpath_dirs_for_classes(bbpath, classtype):
+    dirs = []
+    for p in (bbpath or '').split(':'):
+        if not p:
+            continue
+        for t in ["classes-" + str(classtype), "classes"]:
+            d = os.path.join(p, t)
+            if os.path.isdir(d):
+                dirs.append(d)
+    return dirs
+
+def _dirs_fingerprint(dirs):
+    fp = []
+    for d in dirs:
+        try:
+            st = os.stat(d)
+            fp.append((d, st.st_mtime_ns, st.st_ino))
+        except OSError:
+            fp.append((d, 0, 0))
+    return tuple(fp)
+
+def _build_class_index(bbpath, classtype):
+    dirs = _bbpath_dirs_for_classes(bbpath, classtype)
+    mapping = {}
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                for de in it:
+                    name = de.name
+                    if not name.endswith('.bbclass'):
+                        continue
+                    cls = name[:-8]
+                    # Preserve first match according to directory order
+                    if cls not in mapping:
+                        mapping[cls] = os.path.join(d, name)
+        except OSError:
+            continue
+    return _dirs_fingerprint(dirs), mapping
+
+def _get_class_index(bbpath, classtype):
+    key = (str(classtype), bbpath or '')
+    cached = _class_index_cache.get(key)
+    dirs = _bbpath_dirs_for_classes(bbpath, classtype)
+    fp = _dirs_fingerprint(dirs)
+    if cached is not None:
+        cfp, cmap = cached
+        if cfp == fp:
+            # Refresh LRU
+            try:
+                _class_index_order.remove(key)
+            except ValueError:
+                pass
+            _class_index_order.append(key)
+            return cmap
+    # (Re)build
+    fp, cmap = _build_class_index(bbpath, classtype)
+    _class_index_cache[key] = (fp, cmap)
+    _class_index_order.append(key)
+    if len(_class_index_order) > _class_index_max:
+        old = _class_index_order.pop(0)
+        _class_index_cache.pop(old, None)
+    return cmap
+
+def _inherit_cache_get(key):
+    try:
+        _inherit_resolved_order.remove(key)
+        _inherit_resolved_order.append(key)
+        val = _inherit_resolved_cache[key]
+        if _bb_metrics:
+            _bb_metrics.hit('inherit')
+        return val
+    except (ValueError, KeyError):
+        if _bb_metrics:
+            _bb_metrics.miss('inherit')
+        return None
+
+def _inherit_cache_put(key, value):
+    _inherit_resolved_cache[key] = value
+    _inherit_resolved_order.append(key)
+    if len(_inherit_resolved_order) > _inherit_resolved_max:
+        old = _inherit_resolved_order.pop(0)
+        _inherit_resolved_cache.pop(old, None)
+        if _bb_metrics:
+            _bb_metrics.evict('inherit')
+
+def _resolve_inherit_file(d, origfile):
+    """Resolve an inherit target to an absolute file path and attempts list.
+    Returns (resolved_path, attempts). resolved_path may be None if not found.
+    Attempts is a tuple of candidate paths checked (for dependency marking).
+    """
+    m = _bb_metrics
+    _tok = None
+    if m:
+        try:
+            _tok = m.time_start('inherit')
+        except Exception:
+            _tok = None
+    try:
+        classtype = d.getVar("__bbclasstype", False)
+        bbpath = d.getVar("BBPATH")
+        key = (origfile, classtype, bbpath)
+
+        if not os.path.isabs(origfile) and not origfile.endswith(".bbclass"):
+            cached = _inherit_cache_get(key)
+            if cached is not None:
+                return cached
+
+            attempts_accum = []
+            resolved = None
+            # If the class reference contains subdirectories, fall back to path-based resolution
+            if '/' in origfile:
+                for t in ["classes-" + str(classtype), "classes"]:
+                    cand = os.path.join(t, '%s.bbclass' % origfile)
+                    abs_fn, attempts = bb.utils.which(bbpath, cand, history=True)
+                    attempts_accum.extend(attempts)
+                    if abs_fn:
+                        resolved = abs_fn
+                        break
+            else:
+                # Use class index to map class name to path in O(1)
+                if os.environ.get('BB_OPT_DISABLE_CLASS_INDEX'):
+                    # Simulate miss by falling back to which()
+                    for t in ["classes-" + str(classtype), "classes"]:
+                        cand = os.path.join(t, '%s.bbclass' % origfile)
+                        abs_fn, attempts = bb.utils.which(bbpath, cand, history=True)
+                        attempts_accum.extend(attempts)
+                        if abs_fn:
+                            resolved = abs_fn
+                            break
+                    if _bb_metrics:
+                        _bb_metrics.miss('class_index')
+                else:
+                    cmap = _get_class_index(bbpath, classtype)
+                    resolved = cmap.get(origfile)
+                    if _bb_metrics:
+                        # Count any lookup through index as a hit regardless of found status
+                        if resolved:
+                            _bb_metrics.hit('class_index')
+                        else:
+                            _bb_metrics.miss('class_index')
+                # Generate attempts list in search order for dependency marking
+                for p in (bbpath or '').split(':'):
+                    if not p:
+                        continue
+                    for t in ["classes-" + str(classtype), "classes"]:
+                        cand = os.path.abspath(os.path.join(p, t, '%s.bbclass' % origfile))
+                        attempts_accum.append(cand)
+
+            val = (resolved, tuple(attempts_accum))
+            _inherit_cache_put(key, val)
+            return val
+
+        # Absolute or already a .bbclass - check existence only, no BBPATH search
+        return (origfile if os.path.exists(origfile) else None, tuple())
+    finally:
+        if m and _tok:
+            try:
+                m.time_end('inherit', _tok)
+            except Exception:
+                pass
 
 def supports(fn, d):
     """Return True if fn has a supported extension"""
@@ -58,26 +231,15 @@ def inherit(files, fn, lineno, d, deferred=False):
         if not deferred and file in defer:
             inherit_defer(file, fn, lineno, d)
             continue
-        classtype = d.getVar("__bbclasstype", False)
         origfile = file
-        for t in ["classes-" + classtype, "classes"]:
-            file = origfile
-            if not os.path.isabs(file) and not file.endswith(".bbclass"):
-                file = os.path.join(t, '%s.bbclass' % file)
+        resolved, attempts = _resolve_inherit_file(d, origfile)
+        for af in attempts:
+            if af != resolved:
+                bb.parse.mark_dependency(d, af)
 
-            if not os.path.isabs(file):
-                bbpath = d.getVar("BBPATH")
-                abs_fn, attempts = bb.utils.which(bbpath, file, history=True)
-                for af in attempts:
-                    if af != abs_fn:
-                        bb.parse.mark_dependency(d, af)
-                if abs_fn:
-                    file = abs_fn
+        file = resolved
 
-            if os.path.exists(file):
-                break
-
-        if not os.path.exists(file):
+        if not file or not os.path.exists(file):
             raise ParseError("Could not inherit file %s" % (file), fn, lineno)
 
         if not file in __inherit_cache:
@@ -100,11 +262,8 @@ def get_statements(filename, absolute_filename, base_name):
             statements = ast.StatementGroup()
 
             lineno = 0
-            while True:
-                lineno = lineno + 1
-                s = f.readline()
-                if not s: break
-                s = s.rstrip()
+            for lineno, line in enumerate(f, start=1):
+                s = line.rstrip()
                 feeder(lineno, s, filename, base_name, statements)
 
         if __inpython__:
@@ -130,6 +289,12 @@ def handle(fn, d, include, baseconfig=False):
     base_name = os.path.basename(fn)
     (root, ext) = os.path.splitext(base_name)
     init(d)
+    # Tell metrics where TMPDIR is so it can write its file
+    try:
+        from bb.parse import metrics as _m
+        _m.set_tmpdir(d.getVar('TMPDIR'))
+    except Exception:
+        pass
 
     if ext == ".bbclass":
         __classname__ = root
@@ -157,6 +322,11 @@ def handle(fn, d, include, baseconfig=False):
     except bb.parse.SkipRecipe:
         d.setVar("__SKIPPED", True)
         if include == 0:
+            try:
+                from bb.parse import metrics as _m
+                _m.flush('bbhandler')
+            except Exception:
+                pass
             return { "" : d }
 
     if __infunc__:
@@ -165,6 +335,11 @@ def handle(fn, d, include, baseconfig=False):
         raise ParseError("Leftover unparsed (incomplete?) data %s from %s" % __residue__, fn)
 
     if ext != ".bbclass" and include == 0:
+        try:
+            from bb.parse import metrics as _m
+            _m.flush('bbhandler')
+        except Exception:
+            pass
         return ast.multi_finalize(fn, d)
 
     if ext != ".bbclass" and oldfile and abs_fn != oldfile:
